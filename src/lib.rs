@@ -160,6 +160,9 @@ where
     }
 
     fn put(&mut self, key: K, value: V) -> Result<V> {
+        if self.key_dir.contains_key(&key) {
+            self.delete(&key)?;
+        }
         let serialized_key = bincode::serialize(&key)?;
         let serialized_value = bincode::serialize(&value)?;
         let serialized_key_len = bincode::serialize(&serialized_key.len())?;
@@ -298,7 +301,6 @@ where
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
             .open(db_name)?;
         Ok(Self {
             key_dir: BTreeMap::default(),
@@ -335,7 +337,7 @@ where
         let mut files_to_swap = BTreeSet::new();
         let mut new_key_dir = BTreeMap::new();
         if self.key_dir.is_empty() {
-            for f_id in 1..=self.file_id {
+            for f_id in 2..=self.file_id {
                 fs::remove_file(format!("{}.{}.db", self.prefix, f_id))?;
             }
         }
