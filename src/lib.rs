@@ -2,6 +2,7 @@ use crc::{self, Crc, CRC_32_CKSUM};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fs;
 use std::fs::OpenOptions;
@@ -27,7 +28,7 @@ pub trait Db<K, V> {
 
 pub trait ToDisk<K, V>: Db<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned + Clone,
     V: Serialize + DeserializeOwned + Debug,
 {
     fn open(file_name: &str) -> Result<OnDisk<K, V>>;
@@ -44,10 +45,11 @@ struct Slot {
 
 pub struct OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned + Clone,
     V: Serialize + DeserializeOwned + Debug,
 {
     key_dir: BTreeMap<K, (u64, usize, u64, Slot)>,
+    delete_map: BTreeMap<K, (u64, usize, u64, Slot)>,
     prefix: String,
     file_id: u64,
     file_position: u64,
@@ -55,12 +57,11 @@ where
     is_dirty: bool,
     phantom_data: PhantomData<V>,
     free_slots: BTreeMap<u64, Vec<Slot>>,
-    free_set: BTreeSet<Slot>,
 }
 
 impl<K, V> OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned + Clone,
     V: Serialize + DeserializeOwned + Debug,
 {
     fn get_file_by_id(&self, file_id: u64) -> Result<File> {
@@ -71,7 +72,12 @@ where
 
     fn get_tempfile_by_id(&self, file_id: u64) -> Result<File> {
         let file_name = format!("{}.{}.temp.db", self.prefix, file_id);
-        let file = OpenOptions::new().read(true).write(true).open(file_name)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_name)?;
         Ok(file)
     }
 
@@ -81,7 +87,7 @@ where
         Ok(file)
     }
 
-    fn serialize_to_file(&self, key: &K, value: V, file: File) -> Result<Slot> {
+    fn serialize_to_file(&self, key: &K, value: V, file: File) -> Result<(u64, usize, u64, Slot)> {
         let serialized_key = bincode::serialize(&key)?;
         let serialized_value = bincode::serialize(&value)?;
         let serialized_key_len = bincode::serialize(&serialized_key.len())?;
@@ -105,6 +111,7 @@ where
         writer.write_all(&serialized_key_len)?;
         writer.write_all(&serialized_value_len)?;
         writer.write_all(&serialized_key)?;
+        let value_pos = writer.stream_position()?;
         writer.write_all(&serialized_value)?;
 
         let end_pos = writer.stream_position()?;
@@ -113,13 +120,34 @@ where
             start: start_pos,
             end: end_pos,
         };
-        Ok(free_slot)
+        Ok((self.file_id, serialized_value.len(), value_pos, free_slot))
+    }
+
+    fn get_for_deletion(&self, key: &K) -> Option<V> {
+        if let Some((file_id, value_len, value_pos, _)) = self.delete_map.get(key) {
+            let mut reader = self
+                .get_file_by_id(*file_id)
+                .expect("failed to get file_id");
+            reader
+                .seek(SeekFrom::Start(*value_pos))
+                .expect("failed to seek");
+
+            let mut value_buf = vec![0u8; *value_len];
+            reader
+                .read_exact(&mut value_buf)
+                .expect("failed to read value");
+            let value: V = bincode::deserialize(&value_buf).expect("Failed to deserialize value");
+
+            Some(value)
+        } else {
+            None
+        }
     }
 }
 
 impl<K, V> Drop for OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned + Clone,
     V: Serialize + DeserializeOwned + Debug,
 {
     fn drop(&mut self) {
@@ -129,7 +157,7 @@ where
 
 impl<K, V> Db<K, V> for OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned + Clone,
     V: Serialize + DeserializeOwned + Debug,
 {
     fn get(&self, key: &K) -> Option<V> {
@@ -208,7 +236,6 @@ where
             let mut free_slots = free_slots.clone();
             free_slots.pop();
             self.free_slots.insert(*length, free_slots);
-            self.free_set.insert(free_slot);
             self.file_position = end_pos;
             self.is_dirty = true;
         } else {
@@ -238,7 +265,6 @@ where
                     free_slot.clone(),
                 ),
             );
-            self.free_set.insert(free_slot);
             self.file_position = end_pos;
             self.is_dirty = true;
         }
@@ -247,9 +273,14 @@ where
     }
 
     fn delete(&mut self, key: &K) -> Result<()> {
-        if let Some((_, _, _, free_slot)) = self.key_dir.remove(key) {
+        if let Some((file_id, value_len, value_pos, free_slot)) = self.key_dir.remove(key) {
             let distance = free_slot.end - free_slot.start;
-            self.free_slots.entry(distance).or_default().push(free_slot);
+            self.free_slots
+                .entry(distance)
+                .or_default()
+                .push(free_slot.clone());
+            self.delete_map
+                .insert(key.clone(), (file_id, value_len, value_pos, free_slot));
         }
         Ok(())
     }
@@ -280,7 +311,7 @@ where
 
 impl<K, V> ToDisk<K, V> for OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned + Clone,
     V: Serialize + DeserializeOwned + Debug,
 {
     fn open(file_name: &str) -> Result<OnDisk<K, V>> {
@@ -300,7 +331,7 @@ where
             file_position: 0,
             is_dirty: false,
             free_slots: BTreeMap::default(),
-            free_set: BTreeSet::default(),
+            delete_map: BTreeMap::default(),
         })
     }
 
@@ -320,48 +351,46 @@ where
         Ok(())
     }
 
-    // Do compaction next: take a file, and iterate through the key dir to find all active tuples. Copy
-    // those to a temp file, and swap the file with the old one. Thus, we can get rid of dead tuples.
-
     fn prune(&mut self) -> Result<()> {
         // for every file in 1..self.file_id
         // we want to iterate through and copy
         let mut remaining_slots = vec![];
-        for (
-            key,
-            (
-                _,
-                _,
-                _,
-                Slot {
-                    file_id,
-                    start,
-                    end,
-                },
-            ),
-        ) in &self.key_dir
-        {
+        let mut files_to_swap = HashSet::new();
+        for (key, (_, _, _, Slot { file_id, .. })) in &self.delete_map {
             let tempfile = self.get_tempfile_by_id(*file_id)?;
-            let file = self.get_file_by_id(*file_id)?;
+            let _file = self.get_file_by_id(*file_id);
 
-            let value = self.get(key).unwrap();
+            let value = self
+                .get_for_deletion(key)
+                .expect("Could not find value from key");
             // then write it to tempfile
-            let new_slot = self.serialize_to_file(key, value, tempfile)?;
-            remaining_slots.push((key, new_slot));
-
-            // update self.key_dir with the new location
+            let (file_id, value_len, value_pos, new_slot) =
+                self.serialize_to_file(key, value, tempfile)?;
+            remaining_slots.push((key, file_id, value_len, value_pos, new_slot));
 
             // Finally, swap tempfile and file
+            files_to_swap.insert(file_id);
+        }
+
+        for file_id in files_to_swap {
             fs::rename(
                 format!("{}.{}.temp.db", self.prefix, file_id),
                 format!("{}.{}.db", self.prefix, file_id),
             )?;
         }
 
-        self.key_dir.clear();
-        for (key, slot) in remaining_slots {
-            self.key_dir.insert();
+        // update self.key_dir with the new location
+        let mut new_key_dir = BTreeMap::new();
+        for (key, file_id, value_len, value_pos, slot) in remaining_slots {
+            if self.key_dir.contains_key(key) {
+                new_key_dir.insert(key.clone(), (file_id, value_len, value_pos, slot));
+            }
         }
+
+        self.delete_map = BTreeMap::new();
+        self.key_dir = new_key_dir;
+
+        dbg!(&self.key_dir, &self.delete_map);
 
         Ok(())
     }
