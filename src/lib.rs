@@ -1,54 +1,126 @@
 use crc::{self, Crc, CRC_32_CKSUM};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
+use std::fs;
 use std::fs::OpenOptions;
 use std::hash::Hash;
+use std::io::BufWriter;
 use std::io::Read;
 use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
-use std::io::{BufReader, BufWriter};
+use std::marker::PhantomData;
 use std::{collections::BTreeMap, fs::File};
 
 use anyhow::Result;
 
 pub trait Db<K, V> {
-    fn get(&self, key: &K) -> Option<&V>;
-    fn put(&mut self, key: K, value: V) -> Option<V>;
-    fn delete(&mut self, key: &K) -> Option<V>;
+    fn get(&self, key: &K) -> Option<V>;
+    fn put(&mut self, key: K, value: V) -> Result<V>;
+    fn delete(&mut self, key: &K) -> Result<()>;
+    fn keys(&mut self) -> Vec<&K>;
+    fn values(&mut self) -> Vec<V>;
+    fn items(&mut self) -> Vec<(&K, V)>;
 }
 
 pub trait ToDisk<K, V>: Db<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize,
-    V: Serialize + Debug,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    V: Serialize + DeserializeOwned + Debug,
 {
     fn open(file_name: &str) -> Result<OnDisk<K, V>>;
     fn sync(&mut self) -> Result<()>;
+    fn prune(&mut self) -> Result<()>;
 }
 
-pub trait FromDisk<K, V>: ToDisk<K, V>
-where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize,
-    V: Serialize + Debug,
-{
-    fn hydrate(&mut self) -> Result<()>;
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Slot {
+    file_id: u64,
+    start: u64,
+    end: u64,
 }
 
 pub struct OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize,
-    V: Serialize + Debug,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    V: Serialize + DeserializeOwned + Debug,
 {
-    data: BTreeMap<K, V>,
-    file: File,
+    key_dir: BTreeMap<K, (u64, usize, u64, Slot)>,
+    prefix: String,
+    file_id: u64,
+    file_position: u64,
     crc_hasher: Crc<u32>,
+    is_dirty: bool,
+    phantom_data: PhantomData<V>,
+    free_slots: BTreeMap<u64, Vec<Slot>>,
+    free_set: BTreeSet<Slot>,
+}
+
+impl<K, V> OnDisk<K, V>
+where
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    V: Serialize + DeserializeOwned + Debug,
+{
+    fn get_file_by_id(&self, file_id: u64) -> Result<File> {
+        let file_name = format!("{}.{}.db", self.prefix, file_id);
+        let file = OpenOptions::new().read(true).write(true).open(file_name)?;
+        Ok(file)
+    }
+
+    fn get_tempfile_by_id(&self, file_id: u64) -> Result<File> {
+        let file_name = format!("{}.{}.temp.db", self.prefix, file_id);
+        let file = OpenOptions::new().read(true).write(true).open(file_name)?;
+        Ok(file)
+    }
+
+    fn curr_file(&self) -> Result<File> {
+        let file_name = format!("{}.{}.db", self.prefix, self.file_id);
+        let file = OpenOptions::new().read(true).write(true).open(file_name)?;
+        Ok(file)
+    }
+
+    fn serialize_to_file(&self, key: &K, value: V, file: File) -> Result<Slot> {
+        let serialized_key = bincode::serialize(&key)?;
+        let serialized_value = bincode::serialize(&value)?;
+        let serialized_key_len = bincode::serialize(&serialized_key.len())?;
+        let serialized_value_len = bincode::serialize(&serialized_value.len())?;
+
+        let mut digest = self.crc_hasher.digest();
+
+        digest.update(&serialized_key_len);
+        digest.update(&serialized_value_len);
+        digest.update(&serialized_key);
+        digest.update(&serialized_value);
+
+        let checksum = digest.finalize();
+        let serialized_checksum = bincode::serialize(&checksum)?;
+
+        let mut writer = BufWriter::new(file);
+        writer.seek(SeekFrom::End(0))?;
+        let start_pos = writer.stream_position()?;
+
+        writer.write_all(&serialized_checksum)?;
+        writer.write_all(&serialized_key_len)?;
+        writer.write_all(&serialized_value_len)?;
+        writer.write_all(&serialized_key)?;
+        writer.write_all(&serialized_value)?;
+
+        let end_pos = writer.stream_position()?;
+        let free_slot = Slot {
+            file_id: self.file_id,
+            start: start_pos,
+            end: end_pos,
+        };
+        Ok(free_slot)
+    }
 }
 
 impl<K, V> Drop for OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize,
-    V: Serialize + Debug,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    V: Serialize + DeserializeOwned + Debug,
 {
     fn drop(&mut self) {
         let _ = self.sync();
@@ -57,146 +129,240 @@ where
 
 impl<K, V> Db<K, V> for OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize,
-    V: Serialize + Debug,
-{
-    fn get(&self, key: &K) -> Option<&V> {
-        self.data.get(key)
-    }
-
-    fn put(&mut self, key: K, value: V) -> Option<V> {
-        self.data.insert(key, value)
-    }
-
-    fn delete(&mut self, key: &K) -> Option<V> {
-        self.data.remove(key)
-    }
-}
-
-impl<K, V> FromDisk<K, V> for OnDisk<K, V>
-where
     K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
     V: Serialize + DeserializeOwned + Debug,
 {
-    fn hydrate(&mut self) -> Result<()> {
-        let mut reader = BufReader::new(&self.file);
-        reader.rewind()?;
+    fn get(&self, key: &K) -> Option<V> {
+        if let Some((file_id, value_len, value_pos, _)) = self.key_dir.get(key) {
+            let mut reader = self
+                .get_file_by_id(*file_id)
+                .expect("failed to get file_id");
+            reader
+                .seek(SeekFrom::Start(*value_pos))
+                .expect("failed to seek");
 
-        loop {
-            let mut checksum_buf = [0u8; 4];
-            if reader.read_exact(&mut checksum_buf).is_err() {
-                break;
-            }
+            let mut value_buf = vec![0u8; *value_len];
+            reader
+                .read_exact(&mut value_buf)
+                .expect("failed to read value");
+            let value: V = bincode::deserialize(&value_buf).expect("Failed to deserialize value");
 
-            let mut key_len_buf = [0u8; 8];
-            reader.read_exact(&mut key_len_buf)?;
-
-            let mut value_len_buf = [0u8; 8];
-            reader.read_exact(&mut value_len_buf)?;
-
-            let checksum: u32 = bincode::deserialize(&checksum_buf)?;
-            let key_len: usize = bincode::deserialize(&key_len_buf)?;
-            let value_len: usize = bincode::deserialize(&value_len_buf)?;
-
-            let mut key_buf = vec![0u8; key_len];
-            reader.read_exact(&mut key_buf)?;
-
-            let mut value_buf = vec![0u8; value_len];
-            reader.read_exact(&mut value_buf)?;
-
-            let key: K = bincode::deserialize(&key_buf)?;
-            let value: V = bincode::deserialize(&value_buf)?;
-
-            dbg!(checksum, key_len, value_len, key, value);
+            Some(value)
+        } else {
+            None
         }
-
-        Ok(())
-    }
-}
-
-impl<K, V> ToDisk<K, V> for OnDisk<K, V>
-where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize,
-    V: Serialize + Debug,
-{
-    fn open(file_name: &str) -> Result<OnDisk<K, V>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file_name)?;
-        Ok(Self {
-            data: BTreeMap::default(),
-            file,
-            crc_hasher: Crc::<u32>::new(&CRC_32_CKSUM),
-        })
     }
 
-    fn sync(&mut self) -> Result<()> {
-        let mut writer = BufWriter::new(&self.file);
-        for (key, value) in &self.data {
-            let serialized_key = bincode::serialize(key)?;
-            let serialized_value = bincode::serialize(value)?;
+    fn put(&mut self, key: K, value: V) -> Result<V> {
+        let serialized_key = bincode::serialize(&key)?;
+        let serialized_value = bincode::serialize(&value)?;
+        let serialized_key_len = bincode::serialize(&serialized_key.len())?;
+        let serialized_value_len = bincode::serialize(&serialized_value.len())?;
 
-            let mut digest = self.crc_hasher.digest();
+        let mut digest = self.crc_hasher.digest();
 
-            digest.update(&serialized_key);
-            digest.update(&serialized_value);
+        digest.update(&serialized_key_len);
+        digest.update(&serialized_value_len);
+        digest.update(&serialized_key);
+        digest.update(&serialized_value);
 
-            let checksum = digest.finalize();
-            let serialized_checksum = bincode::serialize(&checksum)?;
-            let serialized_key_len = bincode::serialize(&serialized_key.len())?;
-            let serialized_value_len = bincode::serialize(&serialized_value.len())?;
+        let checksum = digest.finalize();
+        let serialized_checksum = bincode::serialize(&checksum)?;
 
-            dbg!(
-                checksum,
-                serialized_key.len(),
-                serialized_value.len(),
-                &key,
-                &value
-            );
+        let total_len = (serialized_key.len()
+            + serialized_value.len()
+            + serialized_key_len.len()
+            + serialized_value_len.len()
+            + serialized_checksum.len()) as u64;
+
+        let mut items = self.free_slots.range(total_len..);
+
+        if let Some((length, free_slots)) = items.next() {
+            let free_slot = free_slots.last().unwrap();
+            let file = self.get_file_by_id(free_slot.file_id)?;
+            let mut writer = BufWriter::new(file);
+            writer.seek(SeekFrom::Start(free_slot.start))?;
 
             writer.write_all(&serialized_checksum)?;
             writer.write_all(&serialized_key_len)?;
             writer.write_all(&serialized_value_len)?;
             writer.write_all(&serialized_key)?;
+            let value_pos = writer.stream_position()?;
             writer.write_all(&serialized_value)?;
+
+            let end_pos = writer.stream_position()?;
+            let free_slot = Slot {
+                file_id: free_slot.file_id,
+                start: free_slot.start,
+                end: end_pos,
+            };
+            self.key_dir.insert(
+                key,
+                (
+                    free_slot.file_id,
+                    serialized_value.len(),
+                    value_pos,
+                    free_slot.clone(),
+                ),
+            );
+            let mut free_slots = free_slots.clone();
+            free_slots.pop();
+            self.free_slots.insert(*length, free_slots);
+            self.free_set.insert(free_slot);
+            self.file_position = end_pos;
+            self.is_dirty = true;
+        } else {
+            let file = self.curr_file()?;
+            let mut writer = BufWriter::new(file);
+            writer.seek(SeekFrom::Start(self.file_position))?;
+
+            writer.write_all(&serialized_checksum)?;
+            writer.write_all(&serialized_key_len)?;
+            writer.write_all(&serialized_value_len)?;
+            writer.write_all(&serialized_key)?;
+            let value_pos = writer.stream_position()?;
+            writer.write_all(&serialized_value)?;
+
+            let end_pos = writer.stream_position()?;
+            let free_slot = Slot {
+                file_id: self.file_id,
+                start: self.file_position,
+                end: end_pos,
+            };
+            self.key_dir.insert(
+                key,
+                (
+                    self.file_id,
+                    serialized_value.len(),
+                    value_pos,
+                    free_slot.clone(),
+                ),
+            );
+            self.free_set.insert(free_slot);
+            self.file_position = end_pos;
+            self.is_dirty = true;
         }
 
-        self.file.sync_all()?;
+        Ok(value)
+    }
 
-        self.data = BTreeMap::default();
-
+    fn delete(&mut self, key: &K) -> Result<()> {
+        if let Some((_, _, _, free_slot)) = self.key_dir.remove(key) {
+            let distance = free_slot.end - free_slot.start;
+            self.free_slots.entry(distance).or_default().push(free_slot);
+        }
         Ok(())
     }
-}
 
-pub struct InMemory<K, V> {
-    data: BTreeMap<K, V>,
-}
+    fn keys(&mut self) -> Vec<&K> {
+        let keys: Vec<_> = self.key_dir.keys().collect();
+        keys
+    }
 
-impl<K, V> Default for InMemory<K, V> {
-    fn default() -> Self {
-        Self {
-            data: BTreeMap::default(),
+    fn values(&mut self) -> Vec<V> {
+        let mut values = vec![];
+        for value in self.key_dir.keys() {
+            if let Some(v) = self.get(value) {
+                values.push(v);
+            }
         }
+        values
+    }
+
+    fn items(&mut self) -> Vec<(&K, V)> {
+        let mut items = vec![];
+        for k in self.key_dir.keys() {
+            items.push((k, self.get(k).expect("Could not find key")));
+        }
+        items
     }
 }
 
-impl<K, V> Db<K, V> for InMemory<K, V>
+impl<K, V> ToDisk<K, V> for OnDisk<K, V>
 where
-    K: PartialOrd + Ord + PartialEq + Eq + Hash,
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Debug + Serialize + DeserializeOwned,
+    V: Serialize + DeserializeOwned + Debug,
 {
-    fn get(&self, key: &K) -> Option<&V> {
-        self.data.get(key)
+    fn open(file_name: &str) -> Result<OnDisk<K, V>> {
+        let db_name = format!("{}.{}.db", file_name, 1);
+        let _ = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(db_name)?;
+        Ok(Self {
+            key_dir: BTreeMap::default(),
+            prefix: file_name.to_string(),
+            file_id: 1,
+            crc_hasher: Crc::<u32>::new(&CRC_32_CKSUM),
+            phantom_data: PhantomData,
+            file_position: 0,
+            is_dirty: false,
+            free_slots: BTreeMap::default(),
+            free_set: BTreeSet::default(),
+        })
     }
 
-    fn put(&mut self, key: K, value: V) -> Option<V> {
-        self.data.insert(key, value)
+    fn sync(&mut self) -> Result<()> {
+        if self.is_dirty {
+            self.file_id += 1;
+            let db_name = format!("{}.{}.db", self.prefix, self.file_id);
+            let _ = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(db_name)?;
+            self.file_position = 0;
+            self.is_dirty = false;
+        }
+        Ok(())
     }
 
-    fn delete(&mut self, key: &K) -> Option<V> {
-        self.data.remove(key)
+    // Do compaction next: take a file, and iterate through the key dir to find all active tuples. Copy
+    // those to a temp file, and swap the file with the old one. Thus, we can get rid of dead tuples.
+
+    fn prune(&mut self) -> Result<()> {
+        // for every file in 1..self.file_id
+        // we want to iterate through and copy
+        let mut remaining_slots = vec![];
+        for (
+            key,
+            (
+                _,
+                _,
+                _,
+                Slot {
+                    file_id,
+                    start,
+                    end,
+                },
+            ),
+        ) in &self.key_dir
+        {
+            let tempfile = self.get_tempfile_by_id(*file_id)?;
+            let file = self.get_file_by_id(*file_id)?;
+
+            let value = self.get(key).unwrap();
+            // then write it to tempfile
+            let new_slot = self.serialize_to_file(key, value, tempfile)?;
+            remaining_slots.push((key, new_slot));
+
+            // update self.key_dir with the new location
+
+            // Finally, swap tempfile and file
+            fs::rename(
+                format!("{}.{}.temp.db", self.prefix, file_id),
+                format!("{}.{}.db", self.prefix, file_id),
+            )?;
+        }
+
+        self.key_dir.clear();
+        for (key, slot) in remaining_slots {
+            self.key_dir.insert();
+        }
+
+        Ok(())
     }
 }
