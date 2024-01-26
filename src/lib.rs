@@ -1,3 +1,6 @@
+#![feature(let_chains)]
+#![feature(fs_try_exists)]
+
 use crc::{self, Crc, CRC_32_CKSUM};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -186,8 +189,9 @@ where
 
         let mut items = self.free_slots.range(total_len..);
 
-        if let Some((length, free_slots)) = items.next() {
-            let free_slot = free_slots.last().unwrap();
+        if let Some((length, free_slots)) = items.next()
+            && let Some(free_slot) = free_slots.last()
+        {
             let file = self.get_file_by_id(free_slot.file_id)?;
             let mut writer = BufWriter::new(file);
             writer.seek(SeekFrom::Start(free_slot.start))?;
@@ -334,45 +338,142 @@ where
     fn prune(&mut self) -> Result<()> {
         // for every file in 1..self.file_id
         // we want to iterate through and copy
-        let mut files_to_swap = BTreeSet::new();
-        let mut new_key_dir = BTreeMap::new();
-        if self.key_dir.is_empty() {
-            for f_id in 2..=self.file_id {
-                fs::remove_file(format!("{}.{}.db", self.prefix, f_id))?;
+        if self.is_dirty {
+            let mut files_to_swap = BTreeSet::new();
+            let mut new_key_dir = BTreeMap::new();
+            if self.key_dir.is_empty() {
+                for f_id in 2..=self.file_id {
+                    fs::remove_file(format!("{}.{}.db", self.prefix, f_id))?;
+                }
             }
+            for (key, (file_id, value_len, value_pos, Slot { .. })) in &self.key_dir {
+                let tempfile = self.get_tempfile_by_id(*file_id)?;
+                let file = self.get_file_by_id(*file_id)?;
+
+                let mut reader = BufReader::new(file);
+                reader.seek(SeekFrom::Start(*value_pos))?;
+
+                let mut value_buf = vec![0u8; *value_len];
+                reader.read_exact(&mut value_buf)?;
+
+                let value: V = bincode::deserialize(&value_buf)?;
+
+                // then write it to tempfile
+                let (file_id, value_len, value_pos, new_slot) =
+                    self.serialize_to_file(key, value, tempfile)?;
+                new_key_dir.insert(key.clone(), (file_id, value_len, value_pos, new_slot));
+
+                // Finally, swap tempfile and file
+                files_to_swap.insert(file_id);
+            }
+
+            for file_id in files_to_swap {
+                let temp_file_path = format!("{}.{}.temp.db", self.prefix, file_id);
+                let file_path = format!("{}.{}.db", self.prefix, file_id);
+                if fs::try_exists(&temp_file_path).is_ok() {
+                    fs::rename(temp_file_path, file_path)?;
+                }
+            }
+
+            self.delete_map = BTreeMap::new();
+            self.key_dir = new_key_dir;
+            self.is_dirty = false;
         }
-        for (key, (file_id, value_len, value_pos, Slot { .. })) in &self.key_dir {
-            let tempfile = self.get_tempfile_by_id(*file_id)?;
-            let file = self.get_file_by_id(*file_id)?;
-
-            let mut reader = BufReader::new(file);
-            reader.seek(SeekFrom::Start(*value_pos))?;
-
-            let mut value_buf = vec![0u8; *value_len];
-            reader.read_exact(&mut value_buf)?;
-
-            let value: V = bincode::deserialize(&value_buf)?;
-
-            // then write it to tempfile
-            let (file_id, value_len, value_pos, new_slot) =
-                self.serialize_to_file(key, value, tempfile)?;
-            new_key_dir.insert(key.clone(), (file_id, value_len, value_pos, new_slot));
-
-            // Finally, swap tempfile and file
-            files_to_swap.insert(file_id);
-        }
-
-        for file_id in files_to_swap {
-            fs::rename(
-                format!("{}.{}.temp.db", self.prefix, file_id),
-                format!("{}.{}.db", self.prefix, file_id),
-            )?;
-        }
-
-        self.delete_map = BTreeMap::new();
-        self.key_dir = new_key_dir;
-        self.is_dirty = false;
 
         Ok(())
+    }
+}
+
+use Op::*;
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum Op<K, V> {
+    Put { key: K, value: V },
+    Delete { key: K },
+    Update { key: K, value: V },
+    Prune,
+    Sync,
+}
+
+pub fn eval_op<K, V>(db: &mut OnDisk<K, V>, op: Op<K, V>)
+where
+    K: PartialOrd + Ord + PartialEq + Eq + Hash + Serialize + DeserializeOwned + Clone,
+    V: Serialize + DeserializeOwned,
+{
+    match op {
+        Put { key, value } => {
+            db.put(key, value).unwrap();
+        }
+        Delete { key } => {
+            db.delete(&key).unwrap();
+        }
+        Update { key, value } => {
+            db.put(key, value).unwrap();
+        }
+        Prune => {
+            db.prune().unwrap();
+        }
+        Sync => db.sync().unwrap(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_1() {
+        let mut db: OnDisk<String, u64> = OnDisk::open("crash_1").unwrap();
+
+        let instructions = vec![
+            Delete {
+                key: "".to_string(),
+            },
+            Delete {
+                key: "".to_string(),
+            },
+            Put {
+                key: "\0".to_string(),
+                value: 10344644575756526533u64,
+            },
+            Put {
+                key: "\u{1}".to_string(),
+                value: 72339073326448897u64,
+            },
+            Put {
+                key: "\u{1}".to_string(),
+                value: 72057594037928193u64,
+            },
+            Put {
+                key: "".to_string(),
+                value: 0,
+            },
+        ];
+
+        for instruction in instructions {
+            eval_op(&mut db, instruction);
+        }
+
+        assert!(db.sync().is_ok());
+    }
+
+    #[test]
+    fn crash_2() {
+        let mut db: OnDisk<String, u64> = OnDisk::open("crash_2").unwrap();
+
+        let instructions = vec![
+            Put {
+                key: "\0".to_string(),
+                value: 16969173279757565696,
+            },
+            Sync,
+            Prune,
+        ];
+
+        for instruction in instructions {
+            eval_op(&mut db, instruction);
+        }
+
+        assert!(db.sync().is_ok());
     }
 }
